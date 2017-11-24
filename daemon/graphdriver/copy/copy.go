@@ -13,9 +13,11 @@ import "C"
 import (
 	"container/list"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,6 +35,11 @@ const (
 	Content Mode = iota
 	// Hardlink creates a new hardlink to the existing file
 	Hardlink
+)
+
+const (
+	concurrentFileCopies = 8
+	fileCopyChannelDepth = 10000
 )
 
 func copyRegular(srcPath, dstPath string, fileinfo os.FileInfo, copyWithFileRange, copyWithFileClone *bool) error {
@@ -107,6 +114,88 @@ func copyXattr(srcPath, dstPath, attr string) error {
 	return nil
 }
 
+func concurrentCopyHelper(copiedFiles map[fileID]*dstFilePathWithLock, copiedFilesMutex sync.Locker, fileToCopy fileCopyInfo, copyXattrs bool, copyWithFileRange, copyWithFileClone *bool) error {
+	id := fileID{dev: fileToCopy.stat.Dev, ino: fileToCopy.stat.Ino}
+
+	copiedFilesMutex.Lock()
+	copiedFile, ok := copiedFiles[id]
+	if ok {
+		// Immediately unlock the shared mutex
+		copiedFilesMutex.Unlock()
+		// Wait for the dst file path to be created
+		copiedFile.Lock()
+		defer copiedFile.Unlock()
+		// Make the hardlink, and return
+		// it could potentially fail, if the other dstFile
+		// had issues copying
+		return os.Link(copiedFile.path, fileToCopy.dstPath)
+	}
+
+	dstPathWithLock := &dstFilePathWithLock{path: fileToCopy.dstPath}
+	dstPathWithLock.Lock()
+	copiedFiles[id] = dstPathWithLock
+	copiedFilesMutex.Unlock()
+
+	if err := copyRegular(fileToCopy.srcPath, fileToCopy.dstPath, fileToCopy.fileInfo, copyWithFileRange, copyWithFileClone); err != nil {
+		dstPathWithLock.Unlock()
+		return err
+	}
+	dstPathWithLock.Unlock()
+
+	if err := os.Lchown(fileToCopy.dstPath, int(fileToCopy.stat.Uid), int(fileToCopy.stat.Gid)); err != nil {
+		return err
+	}
+
+	if copyXattrs {
+		if err := doCopyXattrs(fileToCopy.srcPath, fileToCopy.dstPath); err != nil {
+			return err
+		}
+	}
+
+	if err := os.Chmod(fileToCopy.dstPath, fileToCopy.fileInfo.Mode()); err != nil {
+		return err
+	}
+
+	aTime := time.Unix(fileToCopy.stat.Atim.Sec, fileToCopy.stat.Atim.Nsec)
+	mTime := time.Unix(fileToCopy.stat.Mtim.Sec, fileToCopy.stat.Mtim.Nsec)
+	if err := system.Chtimes(fileToCopy.dstPath, aTime, mTime); err != nil {
+		return err
+	}
+	return nil
+
+}
+func concurrentFileCopier(copiedFiles map[fileID]*dstFilePathWithLock, copiedFilesMutex sync.Locker, fileCopyErrorChannel chan error, shutdownChan chan struct{}, filesToCopy chan fileCopyInfo, joiner *sync.WaitGroup, copyXattrs bool) {
+	copyWithFileRange := true
+	copyWithFileClone := true
+	defer joiner.Done()
+	for {
+		select {
+		case <-shutdownChan:
+			return
+		case fileToCopy, ok := <-filesToCopy:
+			if !ok {
+				return
+			}
+			if err := concurrentCopyHelper(copiedFiles, copiedFilesMutex, fileToCopy, copyXattrs, &copyWithFileRange, &copyWithFileClone); err != nil {
+				fileCopyErrorChannel <- err
+				return
+			}
+		}
+	}
+}
+
+type fileCopyInfo struct {
+	fileInfo os.FileInfo
+	stat     *syscall.Stat_t
+	srcPath  string
+	dstPath  string
+}
+
+type dstFilePathWithLock struct {
+	sync.Mutex
+	path string
+}
+
 type fileID struct {
 	dev uint64
 	ino uint64
@@ -122,16 +211,33 @@ type dirMtimeInfo struct {
 //
 // Copying xattrs can be opted out of by passing false for copyXattrs.
 func DirCopy(srcDir, dstDir string, copyMode Mode, copyXattrs bool) error {
-	copyWithFileRange := true
-	copyWithFileClone := true
 
 	// This is a map of source file inodes to dst file paths
-	copiedFiles := make(map[fileID]string)
+	copiedFiles := make(map[fileID]*dstFilePathWithLock)
+	copiedFilesMutex := &sync.Mutex{}
 
 	dirsToSetMtimes := list.New()
+	// This is buffered to handle the case where all copiers hit errors simultaneously
+	fileCopyErrorChannel := make(chan error, concurrentFileCopies)
+	shutdownChan := make(chan struct{})
+	joiner := &sync.WaitGroup{}
+	joiner.Add(concurrentFileCopies)
+	concurrentFileCopiers := make([]chan fileCopyInfo, concurrentFileCopies)
+
+	for i := range concurrentFileCopiers {
+		concurrentFileCopiers[i] = make(chan fileCopyInfo, fileCopyChannelDepth)
+		go concurrentFileCopier(copiedFiles, copiedFilesMutex, fileCopyErrorChannel, shutdownChan, concurrentFileCopiers[i], joiner, copyXattrs)
+	}
+
 	err := filepath.Walk(srcDir, func(srcPath string, f os.FileInfo, err error) error {
 		if err != nil {
 			return err
+		}
+		// Check if we had an error land on err chan before
+		select {
+		case err2 := <-fileCopyErrorChannel:
+			return err2
+		default:
 		}
 
 		// Rebase path
@@ -154,23 +260,24 @@ func DirCopy(srcDir, dstDir string, copyMode Mode, copyXattrs bool) error {
 
 		switch f.Mode() & os.ModeType {
 		case 0: // Regular file
-			id := fileID{dev: stat.Dev, ino: stat.Ino}
 			if copyMode == Hardlink {
 				isHardlink = true
 				if err2 := os.Link(srcPath, dstPath); err2 != nil {
 					return err2
 				}
-			} else if hardLinkDstPath, ok := copiedFiles[id]; ok {
-				if err2 := os.Link(hardLinkDstPath, dstPath); err2 != nil {
-					return err2
-				}
 			} else {
-				if err2 := copyRegular(srcPath, dstPath, f, &copyWithFileRange, &copyWithFileClone); err2 != nil {
+				hash := fnv.New32a()
+				if _, err2 := hash.Write([]byte(filepath.Dir(dstPath))); err2 != nil {
 					return err2
 				}
-				copiedFiles[id] = dstPath
+				idx := int(hash.Sum32()) % len(concurrentFileCopiers)
+				select {
+				case concurrentFileCopiers[idx] <- fileCopyInfo{srcPath: srcPath, dstPath: dstPath, fileInfo: f, stat: stat}:
+				case err2 := <-fileCopyErrorChannel:
+					return err2
+				}
+				return nil
 			}
-
 		case os.ModeDir:
 			if err := os.Mkdir(dstPath, f.Mode()); err != nil && !os.IsExist(err) {
 				return err
@@ -250,9 +357,29 @@ func DirCopy(srcDir, dstDir string, copyMode Mode, copyXattrs bool) error {
 		}
 		return nil
 	})
+
 	if err != nil {
+		close(shutdownChan)
+		joiner.Wait()
 		return err
 	}
+
+	waitChan := make(chan struct{})
+	go func() {
+		joiner.Wait()
+		close(waitChan)
+	}()
+	for i := range concurrentFileCopiers {
+		close(concurrentFileCopiers[i])
+	}
+	select {
+	case <-waitChan:
+	case err = <-fileCopyErrorChannel:
+		close(shutdownChan)
+		joiner.Wait()
+		return err
+	}
+
 	for e := dirsToSetMtimes.Front(); e != nil; e = e.Next() {
 		mtimeInfo := e.Value.(dirMtimeInfo)
 		ts := []syscall.Timespec{mtimeInfo.stat.Atim, mtimeInfo.stat.Mtim}
