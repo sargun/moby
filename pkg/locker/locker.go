@@ -25,7 +25,7 @@ var ErrNoSuchLock = errors.New("no such lock")
 // Locker provides a locking mechanism based on the passed in reference name
 type Locker struct {
 	mu    sync.Mutex
-	locks map[string]*lockCtr
+	locks map[interface{}]*lockCtr
 }
 
 // lockCtr is used by Locker to represent a lock with a given name.
@@ -64,15 +64,15 @@ func (l *lockCtr) Unlock() {
 // New creates a new Locker
 func New() *Locker {
 	return &Locker{
-		locks: make(map[string]*lockCtr),
+		locks: make(map[interface{}]*lockCtr),
 	}
 }
 
 // Lock locks a mutex with the given name. If it doesn't exist, one is created
-func (l *Locker) Lock(name string) {
+func (l *Locker) Lock(name interface{}) {
 	l.mu.Lock()
 	if l.locks == nil {
-		l.locks = make(map[string]*lockCtr)
+		l.locks = make(map[interface{}]*lockCtr)
 	}
 
 	nameLock, exists := l.locks[name]
@@ -94,7 +94,7 @@ func (l *Locker) Lock(name string) {
 
 // Unlock unlocks the mutex with the given name
 // If the given lock is not being waited on by any other callers, it is deleted
-func (l *Locker) Unlock(name string) error {
+func (l *Locker) Unlock(name interface{}) error {
 	l.mu.Lock()
 	nameLock, exists := l.locks[name]
 	if !exists {

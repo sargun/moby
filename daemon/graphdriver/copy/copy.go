@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/pkg/pools"
+	"github.com/docker/docker/pkg/locker"
 	"github.com/docker/docker/pkg/system"
 	rsystem "github.com/opencontainers/runc/libcontainer/system"
 	"golang.org/x/sys/unix"
@@ -114,33 +115,24 @@ func copyXattr(srcPath, dstPath, attr string) error {
 	return nil
 }
 
-func concurrentCopyHelper(copiedFiles map[fileID]*dstFilePathWithLock, copiedFilesMutex sync.Locker, fileToCopy fileCopyInfo, copyXattrs bool, copyWithFileRange, copyWithFileClone *bool) error {
+func concurrentCopyHelper(copiedFiles map[fileID]string, copiedFilesLocker *locker.Locker, fileToCopy fileCopyInfo, copyXattrs bool, copyWithFileRange, copyWithFileClone *bool) error {
 	id := fileID{dev: fileToCopy.stat.Dev, ino: fileToCopy.stat.Ino}
 
-	copiedFilesMutex.Lock()
-	copiedFile, ok := copiedFiles[id]
-	if ok {
-		// Immediately unlock the shared mutex
-		copiedFilesMutex.Unlock()
-		// Wait for the dst file path to be created
-		copiedFile.Lock()
-		defer copiedFile.Unlock()
+	copiedFilesLocker.Lock(id)
+	if otherFileName, ok := copiedFiles[id]; ok {
+		copiedFilesLocker.Unlock(id)
 		// Make the hardlink, and return
 		// it could potentially fail, if the other dstFile
 		// had issues copying
-		return os.Link(copiedFile.path, fileToCopy.dstPath)
+		return os.Link(otherFileName, fileToCopy.dstPath)
 	}
-
-	dstPathWithLock := &dstFilePathWithLock{path: fileToCopy.dstPath}
-	dstPathWithLock.Lock()
-	copiedFiles[id] = dstPathWithLock
-	copiedFilesMutex.Unlock()
 
 	if err := copyRegular(fileToCopy.srcPath, fileToCopy.dstPath, fileToCopy.fileInfo, copyWithFileRange, copyWithFileClone); err != nil {
-		dstPathWithLock.Unlock()
+		copiedFilesLocker.Unlock(id)
 		return err
 	}
-	dstPathWithLock.Unlock()
+	copiedFiles[id] = fileToCopy.dstPath
+	copiedFilesLocker.Unlock(id)
 
 	if err := os.Lchown(fileToCopy.dstPath, int(fileToCopy.stat.Uid), int(fileToCopy.stat.Gid)); err != nil {
 		return err
@@ -164,7 +156,7 @@ func concurrentCopyHelper(copiedFiles map[fileID]*dstFilePathWithLock, copiedFil
 	return nil
 
 }
-func concurrentFileCopier(copiedFiles map[fileID]*dstFilePathWithLock, copiedFilesMutex sync.Locker, fileCopyErrorChannel chan error, shutdownChan chan struct{}, filesToCopy chan fileCopyInfo, joiner *sync.WaitGroup, copyXattrs bool) {
+func concurrentFileCopier(copiedFiles map[fileID]string, copiedFilesLocker *locker.Locker, fileCopyErrorChannel chan error, shutdownChan chan struct{}, filesToCopy chan fileCopyInfo, joiner *sync.WaitGroup, copyXattrs bool) {
 	copyWithFileRange := true
 	copyWithFileClone := true
 	defer joiner.Done()
@@ -176,7 +168,7 @@ func concurrentFileCopier(copiedFiles map[fileID]*dstFilePathWithLock, copiedFil
 			if !ok {
 				return
 			}
-			if err := concurrentCopyHelper(copiedFiles, copiedFilesMutex, fileToCopy, copyXattrs, &copyWithFileRange, &copyWithFileClone); err != nil {
+			if err := concurrentCopyHelper(copiedFiles, copiedFilesLocker, fileToCopy, copyXattrs, &copyWithFileRange, &copyWithFileClone); err != nil {
 				fileCopyErrorChannel <- err
 				return
 			}
@@ -189,11 +181,6 @@ type fileCopyInfo struct {
 	stat     *syscall.Stat_t
 	srcPath  string
 	dstPath  string
-}
-
-type dstFilePathWithLock struct {
-	sync.Mutex
-	path string
 }
 
 type fileID struct {
@@ -213,8 +200,8 @@ type dirMtimeInfo struct {
 func DirCopy(srcDir, dstDir string, copyMode Mode, copyXattrs bool) error {
 
 	// This is a map of source file inodes to dst file paths
-	copiedFiles := make(map[fileID]*dstFilePathWithLock)
-	copiedFilesMutex := &sync.Mutex{}
+	copiedFiles := make(map[fileID]string)
+	copiedFilesLocker := locker.New()
 
 	dirsToSetMtimes := list.New()
 	// This is buffered to handle the case where all copiers hit errors simultaneously
@@ -226,7 +213,7 @@ func DirCopy(srcDir, dstDir string, copyMode Mode, copyXattrs bool) error {
 
 	for i := range concurrentFileCopiers {
 		concurrentFileCopiers[i] = make(chan fileCopyInfo, fileCopyChannelDepth)
-		go concurrentFileCopier(copiedFiles, copiedFilesMutex, fileCopyErrorChannel, shutdownChan, concurrentFileCopiers[i], joiner, copyXattrs)
+		go concurrentFileCopier(copiedFiles, copiedFilesLocker, fileCopyErrorChannel, shutdownChan, concurrentFileCopiers[i], joiner, copyXattrs)
 	}
 
 	err := filepath.Walk(srcDir, func(srcPath string, f os.FileInfo, err error) error {
