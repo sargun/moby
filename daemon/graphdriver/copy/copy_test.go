@@ -19,6 +19,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func noop() {
+}
+
 func TestIsCopyFileRangeSyscallAvailable(t *testing.T) {
 	// Verifies:
 	// 1. That copyFileRangeEnabled is being set to true when copy_file_range syscall is available
@@ -143,7 +146,7 @@ func doCopyTest(t *testing.T, copyWithFileRange, copyWithFileClone *bool) {
 	fileinfo, err := os.Stat(srcFilename)
 	require.NoError(t, err)
 
-	require.NoError(t, copyRegular(srcFilename, dstFilename, fileinfo, copyWithFileRange, copyWithFileClone))
+	require.NoError(t, copyRegular(srcFilename, dstFilename, fileinfo, copyWithFileRange, copyWithFileClone, noop))
 	readBuf, err := ioutil.ReadFile(dstFilename)
 	require.NoError(t, err)
 	assert.Equal(t, buf, readBuf)
